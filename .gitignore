@@ -1,0 +1,11 @@
+__pycache__/
+.DS_Store
+*.py[cod]
+.pytest_cache/
+config.json
+*.token
+*.log
+build/
+.build/
+.swiftpm/
+*.xcresult

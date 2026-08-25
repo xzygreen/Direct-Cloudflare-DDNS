@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.direct-cloudflare-ddns</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/usr/local/libexec/cloudflare-ddns/cloudflare_ddns.py</string>
+        <string>--config</string>
+        <string>/usr/local/etc/cloudflare-ddns/config.json</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/cloudflare-ddns.log</string>
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/cloudflare-ddns.log</string>
+</dict>
+</plist>

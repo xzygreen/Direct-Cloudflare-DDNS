@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m unittest discover -s tests -v
+      - run: python -m py_compile cloudflare_ddns.py
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift test --package-path macos
+      - run: BUILD_ARCHS="$(uname -m)" ./scripts/build-macos-app.sh
+      - run: codesign --verify --deep --strict build/DirectCloudflareDDNS.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DirectCloudflareDDNS-${{ runner.arch }}
+          path: |
+            build/*.zip
+            build/*.sha256

@@ -1,0 +1,57 @@
+{
+  "schema_version": 2,
+  "interval_seconds": 300,
+  "request_timeout_seconds": 8,
+  "cloudflare": {
+    "api_token_env": "CLOUDFLARE_API_TOKEN",
+    "api_token_file": null,
+    "zone_name": "example.com",
+    "zone_id": null,
+    "bypass_proxy": false,
+    "create_missing_records": true
+  },
+  "ip_detection": {
+    "bypass_proxy": true,
+    "allow_insecure_http": false,
+    "source_diagnostics": false,
+    "minimum_agreement": {
+      "ipv4": 2,
+      "ipv6": 2
+    },
+    "services": {
+      "ipv4": [
+        "https://api4.ipify.org",
+        "https://ipv4.icanhazip.com",
+        "https://v4.ident.me"
+      ],
+      "ipv6": [
+        "https://api6.ipify.org",
+        "https://ipv6.icanhazip.com",
+        "https://v6.ident.me"
+      ]
+    }
+  },
+  "records": [
+    {
+      "name": "home.example.com",
+      "types": ["A"],
+      "ttl": 1,
+      "proxied": false,
+      "comment": "Managed by direct-cloudflare-ddns"
+    }
+  ],
+  "notifications": {
+    "local_enabled": true,
+    "on_ip_change": true,
+    "on_failure": true,
+    "on_recovery": true,
+    "webhook_enabled": false,
+    "webhook_url": "",
+    "bark_enabled": false,
+    "bark_server": "https://api.day.app",
+    "gotify_enabled": false,
+    "gotify_server": "",
+    "telegram_enabled": false,
+    "telegram_chat_id": ""
+  }
+}

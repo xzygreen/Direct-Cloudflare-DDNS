@@ -1,0 +1,34 @@
+[Unit]
+Description=Direct Cloudflare Dynamic DNS updater
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=cloudflare-ddns
+Group=cloudflare-ddns
+WorkingDirectory=/opt/cloudflare-ddns
+ExecStart=/usr/bin/python3 /opt/cloudflare-ddns/cloudflare_ddns.py --config /etc/cloudflare-ddns/config.json
+Restart=on-failure
+RestartSec=10s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
