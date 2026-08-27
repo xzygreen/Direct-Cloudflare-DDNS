@@ -359,6 +359,64 @@ struct AppConfiguration: Codable {
 // MARK: - Keychain
 
 enum KeychainStore {
+    private static let backgroundAccessFingerprintKey =
+        "backgroundAgentKeychainAccessFingerprint"
+    private static let backgroundAccessAttemptFingerprintKey =
+        "backgroundAgentKeychainAccessAttemptFingerprint"
+
+    private static var backgroundAgentURL: URL {
+        Bundle.main.bundleURL.appendingPathComponent(
+            "Contents/Library/LaunchServices/DirectCloudflareDDNSAgent"
+        )
+    }
+
+    /// The Keychain ACL contains the helper's code identity, not just its path.
+    /// An App update can therefore invalidate an otherwise unchanged Token's
+    /// ACL. Use the signing cdhash to refresh access exactly once per helper
+    /// build instead of rewriting the item before every synchronization.
+    private static func backgroundAgentFingerprint() throws -> String {
+        let agentURL = backgroundAgentURL
+        guard FileManager.default.isExecutableFile(atPath: agentURL.path) else {
+            throw AppFailure.message("应用包内缺少后台同步助手")
+        }
+        var staticCode: SecStaticCode?
+        var status = SecStaticCodeCreateWithPath(agentURL as CFURL, [], &staticCode)
+        guard status == errSecSuccess, let staticCode else {
+            throw AppFailure.message("无法读取后台助手签名：\(message(for: status))")
+        }
+        var signingInformation: CFDictionary?
+        status = SecCodeCopySigningInformation(
+            staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &signingInformation
+        )
+        guard status == errSecSuccess,
+              let information = signingInformation as? [String: Any],
+              let cdhash = information[kSecCodeInfoUnique as String] as? Data else {
+            throw AppFailure.message("无法读取后台助手代码指纹：\(message(for: status))")
+        }
+        return cdhash.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Make an existing Token usable by the current helper build. A failed
+    /// non-interactive restore is remembered so App launches do not repeatedly
+    /// ask for the login password; explicitly toggling scheduling retries it.
+    static func prepareBackgroundAgentAccess(token: String, force: Bool) throws -> Bool {
+        let normalizedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedToken.isEmpty else { return false }
+        let fingerprint = try backgroundAgentFingerprint()
+        let defaults = UserDefaults.standard
+        if defaults.string(forKey: backgroundAccessFingerprintKey) == fingerprint {
+            return true
+        }
+        if !force,
+           defaults.string(forKey: backgroundAccessAttemptFingerprintKey) == fingerprint {
+            return false
+        }
+        defaults.set(fingerprint, forKey: backgroundAccessAttemptFingerprintKey)
+        try saveToken(normalizedToken)
+        defaults.removeObject(forKey: backgroundAccessAttemptFingerprintKey)
+        return true
+    }
+
     /// Give both the foreground App and its embedded LaunchAgent access to the
     /// same keychain items. Without this explicit ACL, macOS trusts only the
     /// process which created the item and asks for the login password whenever
@@ -370,9 +428,7 @@ enum KeychainStore {
             throw AppFailure.message("无法授权主 App 访问钥匙串：\(message(for: status))")
         }
 
-        let agentURL = Bundle.main.bundleURL.appendingPathComponent(
-            "Contents/Library/LaunchServices/DirectCloudflareDDNSAgent"
-        )
+        let agentURL = backgroundAgentURL
         guard FileManager.default.isExecutableFile(atPath: agentURL.path) else {
             throw AppFailure.message("应用包内缺少后台同步助手")
         }
@@ -444,6 +500,10 @@ enum KeychainStore {
         guard status == errSecSuccess else {
             throw AppFailure.message("无法保存 Token 到钥匙串：\(message(for: status))")
         }
+        // The write above installed an ACL for this exact helper identity.
+        let fingerprint = try backgroundAgentFingerprint()
+        UserDefaults.standard.set(fingerprint, forKey: backgroundAccessFingerprintKey)
+        UserDefaults.standard.removeObject(forKey: backgroundAccessAttemptFingerprintKey)
     }
 
     static func loadNotificationSecrets() -> NotificationSecrets {
@@ -1749,7 +1809,23 @@ final class AppModel: ObservableObject {
         nextSync = Date().addingTimeInterval(interval)
         schedulerEnabled = true
         UserDefaults.standard.set(true, forKey: "schedulerEnabled")
-        usingBackgroundAgent = setBackgroundAgent(enabled: true)
+        var backgroundAccessReady = false
+        do {
+            backgroundAccessReady = try KeychainStore.prepareBackgroundAgentAccess(
+                token: token,
+                force: runImmediately
+            )
+        } catch {
+            appendLog(
+                "后台助手无法读取 Token，已回退到 App 内定时同步：\(error.localizedDescription)",
+                level: .warning
+            )
+        }
+        usingBackgroundAgent = backgroundAccessReady && setBackgroundAgent(enabled: true)
+        if !usingBackgroundAgent {
+            // Do not leave a previously registered but unusable helper running.
+            _ = setBackgroundAgent(enabled: false)
+        }
 
         // A 1-second poll drives the countdown and, unlike a long repeating timer,
         // notices immediately after a sleep/wake that the deadline has passed.
