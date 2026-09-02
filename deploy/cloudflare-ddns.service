@@ -10,6 +10,7 @@ Group=cloudflare-ddns
 WorkingDirectory=/opt/cloudflare-ddns
 ExecStart=/usr/bin/python3 /opt/cloudflare-ddns/cloudflare_ddns.py --config /etc/cloudflare-ddns/config.json
 Restart=on-failure
+RestartPreventExitStatus=2 3
 RestartSec=10s
 UMask=0077
 NoNewPrivileges=true

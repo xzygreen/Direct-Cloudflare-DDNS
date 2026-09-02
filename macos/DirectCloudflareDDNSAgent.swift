@@ -125,6 +125,21 @@ private func bundleContentsDirectory() -> URL {
     return candidates.first ?? URL(fileURLWithPath: "/Contents")
 }
 
+private func meetsMinimumPythonVersion(_ path: String) -> Bool {
+    let probe = Process()
+    probe.executableURL = URL(fileURLWithPath: path)
+    probe.arguments = ["-c", "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)"]
+    probe.standardOutput = FileHandle.nullDevice
+    probe.standardError = FileHandle.nullDevice
+    do {
+        try probe.run()
+        probe.waitUntilExit()
+        return probe.terminationStatus == 0
+    } catch {
+        return false
+    }
+}
+
 private func pythonExecutable(resources: URL) -> URL? {
     let candidates = [
         resources.appendingPathComponent("python/bin/python3").path,
@@ -133,8 +148,9 @@ private func pythonExecutable(resources: URL) -> URL? {
         "/usr/local/bin/python3",
         "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
     ]
-    return candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) })
-        .map { URL(fileURLWithPath: $0) }
+    return candidates.first(where: {
+        FileManager.default.isExecutableFile(atPath: $0) && meetsMinimumPythonVersion($0)
+    }).map { URL(fileURLWithPath: $0) }
 }
 
 private func interval(from configURL: URL) -> TimeInterval {
@@ -151,12 +167,16 @@ private func writeStatus(
     output: String,
     error: String? = nil
 ) {
+    let eventLines = output.components(separatedBy: .newlines)
+        .filter { $0.hasPrefix("@@DDNS_EVENT@@") }
     var document: [String: Any] = [
         "timestamp": ISO8601DateFormatter().string(from: Date()),
         "started_at": ISO8601DateFormatter().string(from: started),
         "exit_code": Int(exitCode),
         "success": exitCode == 0,
+        "skipped": exitCode == 3,
         "output": String(output.suffix(16_384)),
+        "events": eventLines,
     ]
     if let error { document["error"] = error }
     guard let data = try? JSONSerialization.data(
@@ -270,35 +290,45 @@ private func processNotifications(
     }
 
     let secrets = loadNotificationSecrets()
+    var changes: [String] = []
+    if !oldIPv4.isEmpty, oldIPv4 != ipv4 { changes.append("IPv4：\(oldIPv4) → \(ipv4)") }
+    if !oldIPv6.isEmpty, oldIPv6 != ipv6 { changes.append("IPv6：\(oldIPv6) → \(ipv6)") }
+    if !changes.isEmpty, settings["on_ip_change"] as? Bool ?? true {
+        deliverNotification(
+            title: "公网 IP 已变化", body: changes.joined(separator: "\n"),
+            settings: settings, secrets: secrets
+        )
+    }
     if !success, !wasFailed, settings["on_failure"] as? Bool ?? true {
         deliverNotification(
             title: "Cloudflare DDNS 同步失败",
-            body: "后台同步未成功，请打开应用查看运行日志。",
+            body: "后台同步未全部成功，请打开应用查看运行日志。",
             settings: settings,
             secrets: secrets
         )
-    } else if success {
-        if wasFailed, settings["on_recovery"] as? Bool ?? true {
-            deliverNotification(
-                title: "Cloudflare DDNS 已恢复", body: "后台同步已恢复正常。",
-                settings: settings, secrets: secrets
-            )
-        }
-        var changes: [String] = []
-        if !oldIPv4.isEmpty, oldIPv4 != ipv4 { changes.append("IPv4：\(oldIPv4) → \(ipv4)") }
-        if !oldIPv6.isEmpty, oldIPv6 != ipv6 { changes.append("IPv6：\(oldIPv6) → \(ipv6)") }
-        if !changes.isEmpty, settings["on_ip_change"] as? Bool ?? true {
-            deliverNotification(
-                title: "公网 IP 已变化", body: changes.joined(separator: "\n"),
-                settings: settings, secrets: secrets
-            )
-        }
+    } else if success, wasFailed, settings["on_recovery"] as? Bool ?? true {
+        deliverNotification(
+            title: "Cloudflare DDNS 已恢复", body: "后台同步已恢复正常。",
+            settings: settings, secrets: secrets
+        )
     }
 
     let next: [String: Any] = ["ipv4": ipv4, "ipv6": ipv6, "last_failed": !success]
     if let data = try? JSONSerialization.data(withJSONObject: next, options: [.sortedKeys]) {
         try? data.write(to: stateURL, options: .atomic)
     }
+}
+
+private func finishFailure(
+    support: URL,
+    config: URL,
+    started: Date,
+    message: String
+) {
+    if FileManager.default.fileExists(atPath: config.path) {
+        processNotifications(configURL: config, output: message, success: false, support: support)
+    }
+    writeStatus(support: support, exitCode: 2, started: started, output: "", error: message)
 }
 
 private func runSync() {
@@ -308,50 +338,55 @@ private func runSync() {
     let resources = bundleContentsDirectory().appendingPathComponent("Resources")
     let backend = resources.appendingPathComponent("cloudflare_ddns.py")
     guard FileManager.default.fileExists(atPath: config.path) else {
-        writeStatus(support: support, exitCode: 2, started: started, output: "", error: "配置文件不存在")
+        finishFailure(support: support, config: config, started: started, message: "配置文件不存在")
         return
     }
     guard FileManager.default.isReadableFile(atPath: backend.path) else {
-        writeStatus(
-            support: support,
-            exitCode: 2,
-            started: started,
-            output: "",
-            error: "应用包内缺少 cloudflare_ddns.py：\(backend.path)"
+        finishFailure(
+            support: support, config: config, started: started,
+            message: "应用包内缺少 cloudflare_ddns.py：\(backend.path)"
         )
         return
     }
     guard let token = loadToken() else {
-        writeStatus(support: support, exitCode: 2, started: started, output: "", error: "钥匙串中没有 API Token")
+        finishFailure(support: support, config: config, started: started, message: "钥匙串中没有 API Token")
         return
     }
     guard let python = pythonExecutable(resources: resources) else {
-        writeStatus(support: support, exitCode: 2, started: started, output: "", error: "找不到 Python 3.9+")
+        finishFailure(support: support, config: config, started: started, message: "找不到 Python 3.9+")
         return
     }
 
     let process = Process()
     process.executableURL = python
-    process.arguments = [backend.path, "--config", config.path, "--json-events", "--once"]
+    process.arguments = [
+        backend.path, "--config", config.path, "--json-events", "--api-token-stdin", "--once",
+    ]
     process.currentDirectoryURL = support
     var environment = ProcessInfo.processInfo.environment
-    environment["CLOUDFLARE_API_TOKEN"] = token
+    environment.removeValue(forKey: "CLOUDFLARE_API_TOKEN")
     environment["PYTHONUNBUFFERED"] = "1"
     process.environment = environment
+    let tokenInput = Pipe()
+    process.standardInput = tokenInput
     let pipe = Pipe()
     process.standardOutput = pipe
     process.standardError = pipe
     do {
         try process.run()
+        tokenInput.fileHandleForWriting.write(Data((token + "\n").utf8))
+        try? tokenInput.fileHandleForWriting.close()
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         let output = String(decoding: data, as: UTF8.self)
-        processNotifications(
-            configURL: config,
-            output: output,
-            success: process.terminationStatus == 0,
-            support: support
-        )
+        if process.terminationStatus != 3 {
+            processNotifications(
+                configURL: config,
+                output: output,
+                success: process.terminationStatus == 0,
+                support: support
+            )
+        }
         writeStatus(
             support: support,
             exitCode: process.terminationStatus,
@@ -359,22 +394,33 @@ private func runSync() {
             output: output
         )
     } catch {
-        writeStatus(
-            support: support, exitCode: 2, started: started, output: "",
-            error: error.localizedDescription
+        try? tokenInput.fileHandleForWriting.close()
+        finishFailure(
+            support: support, config: config, started: started,
+            message: error.localizedDescription
         )
     }
+}
+
+private func consumeSyncRequest(in support: URL) -> Bool {
+    let url = support.appendingPathComponent("sync-now.request")
+    guard FileManager.default.fileExists(atPath: url.path) else { return false }
+    try? FileManager.default.removeItem(at: url)
+    return true
 }
 
 signal(SIGTERM, handleSignal)
 signal(SIGINT, handleSignal)
 
 while !shouldStop {
+    let support = supportDirectory()
+    _ = consumeSyncRequest(in: support)
     autoreleasepool { runSync() }
-    let deadline = Date().addingTimeInterval(
-        interval(from: supportDirectory().appendingPathComponent("config.json"))
-    )
-    while !shouldStop && Date() < deadline {
-        Thread.sleep(forTimeInterval: min(1, deadline.timeIntervalSinceNow))
+    let deadline = ProcessInfo.processInfo.systemUptime
+        + interval(from: support.appendingPathComponent("config.json"))
+    while !shouldStop && ProcessInfo.processInfo.systemUptime < deadline {
+        if consumeSyncRequest(in: support) { break }
+        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+        Thread.sleep(forTimeInterval: min(1, max(0, remaining)))
     }
 }

@@ -409,12 +409,19 @@ enum KeychainStore {
         }
         if !force,
            defaults.string(forKey: backgroundAccessAttemptFingerprintKey) == fingerprint {
-            return false
+            // 清理旧版本留下的永久失败标记，并允许本次重新尝试。
+            defaults.removeObject(forKey: backgroundAccessAttemptFingerprintKey)
         }
         defaults.set(fingerprint, forKey: backgroundAccessAttemptFingerprintKey)
-        try saveToken(normalizedToken)
-        defaults.removeObject(forKey: backgroundAccessAttemptFingerprintKey)
-        return true
+        do {
+            try saveToken(normalizedToken)
+            defaults.removeObject(forKey: backgroundAccessAttemptFingerprintKey)
+            return true
+        } catch {
+            // 取消授权不应永久毒化该版本；下次启动或手动切换时可以重试。
+            defaults.removeObject(forKey: backgroundAccessAttemptFingerprintKey)
+            throw error
+        }
     }
 
     /// Give both the foreground App and its embedded LaunchAgent access to the
@@ -682,7 +689,9 @@ struct AgentStatus: Decodable {
     let started_at: String?
     let exit_code: Int
     let success: Bool
+    let skipped: Bool?
     let output: String
+    let events: [String]?
     let error: String?
 }
 
@@ -789,6 +798,10 @@ final class AppModel: ObservableObject {
         supportDirectory.appendingPathComponent("runtime-state.json")
     }
 
+    private var syncRequestURL: URL {
+        supportDirectory.appendingPathComponent("sync-now.request")
+    }
+
     var hasToken: Bool {
         !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -892,11 +905,8 @@ final class AppModel: ObservableObject {
             }
             return
         }
+        // 当前地址只信任结构化 ip_detected 事件；错误日志中的私网地址不能污染概览。
         appendLog(trimmed, level: Self.level(of: trimmed))
-
-        let found = AddressParser.addresses(in: trimmed)
-        if let v4 = found.v4 { detectedIPv4 = v4 }
-        if let v6 = found.v6 { detectedIPv6 = v6 }
     }
 
     private func handleBackendEvent(_ event: BackendEvent) {
@@ -1338,6 +1348,12 @@ final class AppModel: ObservableObject {
             appendLog("请先填写 Cloudflare API Token", level: .error)
             return
         }
+        do {
+            try persistCredentialChanges()
+        } catch {
+            appendLog("无法保存 Cloudflare API Token：\(error.localizedDescription)", level: .error)
+            return
+        }
         let lookup = pythonExecutable()
         guard let python = lookup.url, let backend = backendURL() else {
             appendLog("发现区域需要 Python 3.9+ 和完整的应用后端", level: .error)
@@ -1345,19 +1361,26 @@ final class AppModel: ObservableObject {
         }
         let process = Process()
         process.executableURL = python
-        process.arguments = [backend.path, "--discover"]
+        process.arguments = [backend.path, "--discover", "--api-token-stdin"]
             + (zoneID.map { ["--discover-zone-id", $0] } ?? [])
         var environment = ProcessInfo.processInfo.environment
-        environment["CLOUDFLARE_API_TOKEN"] = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        environment.removeValue(forKey: "CLOUDFLARE_API_TOKEN")
         environment["PYTHONUNBUFFERED"] = "1"
         process.environment = environment
+        let tokenInput = Pipe()
+        process.standardInput = tokenInput
         let stdout = Pipe()
         let stderr = Pipe()
         process.standardOutput = stdout
         process.standardError = stderr
         do {
             try process.run()
+            tokenInput.fileHandleForWriting.write(
+                Data((token.trimmingCharacters(in: .whitespacesAndNewlines) + "\n").utf8)
+            )
+            try? tokenInput.fileHandleForWriting.close()
         } catch {
+            try? tokenInput.fileHandleForWriting.close()
             appendLog("无法启动 Cloudflare 发现任务：\(error.localizedDescription)", level: .error)
             return
         }
@@ -1473,9 +1496,9 @@ final class AppModel: ObservableObject {
         }
         do {
             try validateConfiguration(requiresToken: requiresToken)
-            // Sync needs the latest JSON configuration, but it must never
-            // modify Keychain items or their ACLs. The token is already held
-            // in memory and is passed directly to the child process.
+            if requiresToken {
+                try persistCredentialChanges()
+            }
             try saveConfiguration(report: false, persistCredentials: false)
         } catch {
             statusText = "配置有误"
@@ -1506,22 +1529,30 @@ final class AppModel: ObservableObject {
 
         let process = Process()
         process.executableURL = python
-        process.arguments = [backend.path, "--config", configURL.path, "--json-events"] + arguments
+        process.arguments = [backend.path, "--config", configURL.path, "--json-events"]
+            + (requiresToken ? ["--api-token-stdin"] : [])
+            + arguments
         process.currentDirectoryURL = supportDirectory
         var environment = ProcessInfo.processInfo.environment
+        environment.removeValue(forKey: "CLOUDFLARE_API_TOKEN")
         environment["PYTHONUNBUFFERED"] = "1"
-        if requiresToken {
-            environment["CLOUDFLARE_API_TOKEN"] = token
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
         process.environment = environment
+        let tokenInput: Pipe? = requiresToken ? Pipe() : nil
+        process.standardInput = tokenInput
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
 
         do {
             try process.run()
+            if let tokenInput {
+                tokenInput.fileHandleForWriting.write(
+                    Data((token.trimmingCharacters(in: .whitespacesAndNewlines) + "\n").utf8)
+                )
+                try? tokenInput.fileHandleForWriting.close()
+            }
         } catch {
+            try? tokenInput?.fileHandleForWriting.close()
             statusText = "启动失败"
             runState = .failure
             appendLog("无法启动后台程序：\(error.localizedDescription)", level: .error)
@@ -1582,7 +1613,12 @@ final class AppModel: ObservableObject {
             addHistory(action: action, success: false, duration: duration, summary: "用户取消")
             return
         }
-        if code == 0 {
+        if code == 3 {
+            runState = .idle
+            statusText = "已有同步正在运行"
+            appendLog("另一同步实例正在运行，本次\(action)已跳过", level: .warning)
+            addHistory(action: action, success: true, duration: duration, summary: "已跳过：实例忙")
+        } else if code == 0 {
             runState = .success
             statusText = "\(action)成功"
             appendLog("\(action)完成")
@@ -1628,17 +1664,6 @@ final class AppModel: ObservableObject {
 
     private func dispatchCompletionNotifications(success: Bool, recovered: Bool) {
         let settings = config.notifications
-        if !success, settings.on_failure {
-            sendNotification(
-                title: "Cloudflare DDNS 同步失败",
-                body: currentRunChanges.last ?? "请打开运行日志查看详细错误"
-            )
-            return
-        }
-        guard success else { return }
-        if recovered, settings.on_recovery {
-            sendNotification(title: "Cloudflare DDNS 已恢复", body: "最新一次同步已成功完成")
-        }
         let v4Changed = !addressesBeforeRun.v4.isEmpty
             && addressesBeforeRun.v4 != detectedIPv4 && !detectedIPv4.isEmpty
         let v6Changed = !addressesBeforeRun.v6.isEmpty
@@ -1648,6 +1673,16 @@ final class AppModel: ObservableObject {
             if v4Changed { parts.append("IPv4：\(addressesBeforeRun.v4) → \(detectedIPv4)") }
             if v6Changed { parts.append("IPv6：\(addressesBeforeRun.v6) → \(detectedIPv6)") }
             sendNotification(title: "公网 IP 已变化", body: parts.joined(separator: "\n"))
+        }
+        if !success, settings.on_failure {
+            sendNotification(
+                title: "Cloudflare DDNS 同步失败",
+                body: currentRunChanges.last ?? "请打开运行日志查看详细错误"
+            )
+            return
+        }
+        if success, recovered, settings.on_recovery {
+            sendNotification(title: "Cloudflare DDNS 已恢复", body: "最新一次同步已成功完成")
         }
     }
 
@@ -1759,8 +1794,7 @@ final class AppModel: ObservableObject {
                 if model.hasObservedNetworkPath,
                    available, !model.networkWasAvailable, model.schedulerEnabled {
                     model.appendLog("网络连接已恢复，准备立即同步")
-                    model.nextSync = Date()
-                    model.tick()
+                    model.requestImmediateScheduledSync()
                 }
                 model.hasObservedNetworkPath = true
                 model.networkWasAvailable = available
@@ -1776,8 +1810,7 @@ final class AppModel: ObservableObject {
             Task { @MainActor in
                 guard model.schedulerEnabled else { return }
                 model.appendLog("系统已唤醒，准备检查公网 IP")
-                model.nextSync = Date()
-                model.tick()
+                model.requestImmediateScheduledSync()
             }
         }
     }
@@ -1790,12 +1823,28 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func requestImmediateScheduledSync() {
+        nextSync = Date()
+        if usingBackgroundAgent {
+            do {
+                try FileManager.default.createDirectory(
+                    at: supportDirectory, withIntermediateDirectories: true
+                )
+                try Data(String(Date().timeIntervalSince1970).utf8)
+                    .write(to: syncRequestURL, options: .atomic)
+            } catch {
+                appendLog("无法唤醒后台助手：\(error.localizedDescription)", level: .warning)
+            }
+        } else {
+            tick()
+        }
+    }
+
     private func startScheduler(runImmediately: Bool) {
         do {
             try validateConfiguration(requiresToken: true)
-            // Enabling or restoring the scheduler is a configuration-only
-            // operation. Rewriting Keychain ACLs here causes repeated system
-            // password prompts and is unnecessary.
+            // Token 文本一旦变化必须先写入钥匙串，确保 GUI 与 Agent 使用同一凭据。
+            try persistCredentialChanges()
             try saveConfiguration(report: false, persistCredentials: false)
         } catch {
             schedulerEnabled = false
@@ -1822,10 +1871,7 @@ final class AppModel: ObservableObject {
             )
         }
         usingBackgroundAgent = backgroundAccessReady && setBackgroundAgent(enabled: true)
-        if !usingBackgroundAgent {
-            // Do not leave a previously registered but unusable helper running.
-            _ = setBackgroundAgent(enabled: false)
-        }
+        // 授权失败或待系统批准时保留注册项，不要注销一个原本仍可工作的助手。
 
         // A 1-second poll drives the countdown and, unlike a long repeating timer,
         // notices immediately after a sleep/wake that the deadline has passed.
@@ -1851,8 +1897,12 @@ final class AppModel: ObservableObject {
                 : "后台助手不可用，已使用 App 内定时同步（\(intervalDescription)执行一次）",
             level: usingBackgroundAgent ? .app : .warning
         )
-        if runImmediately && !usingBackgroundAgent {
-            syncNow()
+        if runImmediately {
+            if usingBackgroundAgent {
+                requestImmediateScheduledSync()
+            } else {
+                syncNow()
+            }
         }
     }
 
@@ -1897,7 +1947,14 @@ final class AppModel: ObservableObject {
         )
         do {
             if enabled {
-                if service.status != .enabled { try service.register() }
+                if service.status == .notRegistered { try service.register() }
+                if service.status == .requiresApproval {
+                    appendLog(
+                        "后台助手等待系统批准，请到“系统设置 → 通用 → 登录项”允许后重试",
+                        level: .warning
+                    )
+                    return false
+                }
             } else if service.status != .notRegistered {
                 try service.unregister()
             }
@@ -1920,7 +1977,11 @@ final class AppModel: ObservableObject {
         UserDefaults.standard.set(status.timestamp, forKey: "lastAgentStatusTimestamp")
         currentRunChanges = []
         addressesBeforeRun = (detectedIPv4, detectedIPv6)
-        for line in status.output.components(separatedBy: .newlines) {
+        for line in status.events ?? [] {
+            ingestBackendLine(line)
+        }
+        for line in status.output.components(separatedBy: .newlines)
+            where !line.hasPrefix("@@DDNS_EVENT@@") {
             ingestBackendLine(line)
         }
         if let error = status.error, !error.isEmpty {
@@ -1931,12 +1992,15 @@ final class AppModel: ObservableObject {
         let duration = status.started_at.flatMap(formatter.date(from:)).map {
             date.timeIntervalSince($0)
         } ?? 0
+        let skipped = status.skipped == true
         if status.success { lastSync = date }
         addHistory(
-            action: "后台同步", success: status.success, duration: duration,
-            summary: status.success ? "完成" : "退出码 \(status.exit_code)"
+            action: "后台同步", success: status.success || skipped, duration: duration,
+            summary: skipped ? "已跳过：实例忙" : (status.success ? "完成" : "退出码 \(status.exit_code)")
         )
-        lastRunFailed = !status.success
+        if !skipped {
+            lastRunFailed = !status.success
+        }
         persistRuntimeState()
     }
 

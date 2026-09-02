@@ -52,6 +52,24 @@ class QueueOpener:
         return FakeResponse(json.dumps(response))
 
 
+class ReadTimeoutResponse(FakeResponse):
+    def __init__(self):
+        super().__init__(b"")
+
+    def read(self, _size=-1):
+        raise ddns.socket.timeout("read timed out")
+
+
+class ReadTimeoutOpener:
+    def __init__(self):
+        self.requests = []
+
+    def open(self, request, timeout):
+        del timeout
+        self.requests.append(request)
+        return ReadTimeoutResponse()
+
+
 def minimal_config():
     return {
         "cloudflare": {
@@ -188,6 +206,14 @@ class ConfigTests(unittest.TestCase):
             )
         self.assertEqual(token, "secret")
 
+    def test_token_override_avoids_environment(self):
+        with mock.patch.dict(os.environ, {"SPECIAL_CF_TOKEN": "old"}, clear=False):
+            token = ddns.read_api_token(
+                {"api_token_env": "SPECIAL_CF_TOKEN", "api_token_file": None},
+                override=" new ",
+            )
+        self.assertEqual(token, "new")
+
 
 class DetectorTests(unittest.TestCase):
     def detector(self, values, agreement=2):
@@ -239,6 +265,15 @@ class DetectorTests(unittest.TestCase):
         with self.assertRaisesRegex(ddns.DetectionError, "所有 IPv4"):
             self.detector(values, agreement=1).detect("ipv4")
 
+    def test_rejects_non_unicast_global_addresses(self):
+        for text in ("224.0.0.1", "ff02::1", "::ffff:8.8.8.8", "64:ff9b::808:808"):
+            with self.subTest(text=text):
+                self.assertFalse(ddns._is_global_unicast(ddns.ipaddress.ip_address(text)))
+        self.assertTrue(ddns._is_global_unicast(ddns.ipaddress.ip_address("8.8.8.8")))
+        self.assertTrue(
+            ddns._is_global_unicast(ddns.ipaddress.ip_address("2606:4700:4700::1111"))
+        )
+
     def test_direct_opener_installs_empty_proxy_handler(self):
         with mock.patch("urllib.request.build_opener") as build:
             ddns._direct_opener()
@@ -285,6 +320,17 @@ class CloudflareClientTests(unittest.TestCase):
         self.assertEqual(result, [])
         self.assertEqual(len(opener.requests), 2)
         fake_sleep.assert_called_once_with(1.0)
+
+    def test_response_read_timeout_is_retried(self):
+        opener = ReadTimeoutOpener()
+        client = ddns.CloudflareClient("token", 3, opener=opener)
+        with mock.patch.object(ddns.time, "sleep") as fake_sleep:
+            with self.assertRaises(ddns.CloudflareError):
+                client.request("GET", "/zones")
+        self.assertEqual(len(opener.requests), 4)
+        self.assertEqual(
+            [call.args[0] for call in fake_sleep.call_args_list], [1.0, 2.0, 4.0]
+        )
 
     def test_retry_after_header_is_honored(self):
         opener = QueueOpener(
@@ -502,6 +548,16 @@ class SingleInstanceLockTests(unittest.TestCase):
         self.assertFalse(second.acquire())
         first.release()
         self.assertTrue(second.acquire())
+
+    def test_same_record_is_locked_across_different_config_paths(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        first = ddns.SingleInstanceLock(Path(directory.name) / "one.json", minimal_config())
+        second = ddns.SingleInstanceLock(Path(directory.name) / "two.json", minimal_config())
+        self.addCleanup(first.release)
+        self.addCleanup(second.release)
+        self.assertTrue(first.acquire())
+        self.assertFalse(second.acquire())
 
 
 if __name__ == "__main__":

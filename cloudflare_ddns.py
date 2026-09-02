@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import signal
+import socket
 import stat
 import sys
 import tempfile
@@ -419,7 +420,13 @@ def load_config(path: Path) -> Dict[str, Any]:
     }
 
 
-def read_api_token(config: Mapping[str, Any]) -> str:
+def read_api_token(config: Mapping[str, Any], override: Optional[str] = None) -> str:
+    if override is not None:
+        token = override.strip()
+        if token:
+            return token
+        raise ConfigError("从标准输入读取到的 API Token 为空")
+
     env_name = config["api_token_env"]
     token = os.environ.get(env_name, "").strip()
     if token:
@@ -445,57 +452,76 @@ def read_api_token(config: Mapping[str, Any]) -> str:
 
 
 class SingleInstanceLock:
-    """按配置文件路径互斥，防止多个实例同时更新同一批 DNS 记录。
+    """按实际 DNS 记录目标互斥，防止不同配置路径并发修改同一记录。"""
 
-    锁文件放在系统临时目录（文件名带 uid 与配置路径哈希），用 flock/msvcrt
-    建立操作系统级排他锁：进程退出（含崩溃）时锁自动释放，不会留下需要
-    人工清理的陈旧锁。
-    """
+    def __init__(
+        self,
+        config_path: Path,
+        config: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        identities: List[str] = []
+        if config is not None:
+            for record in config.get("records", []):
+                name = str(record.get("name", "")).lower().rstrip(".")
+                for record_type in record.get("types", []):
+                    if name and record_type in ("A", "AAAA"):
+                        identities.append(f"record:{record_type}:{name}")
+        if not identities:
+            try:
+                resolved = str(config_path.resolve())
+            except OSError:
+                resolved = str(config_path)
+            identities = [f"config:{resolved}"]
 
-    def __init__(self, config_path: Path) -> None:
-        try:
-            resolved = str(config_path.resolve())
-        except OSError:
-            resolved = str(config_path)
-        digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:16]
         uid = os.getuid() if hasattr(os, "getuid") else 0
-        self.path = Path(tempfile.gettempdir()) / f"cloudflare-ddns-{uid}-{digest}.lock"
-        self._handle: Optional[Any] = None
+        self.paths = [
+            Path(tempfile.gettempdir())
+            / f"cloudflare-ddns-{uid}-{hashlib.sha256(value.encode('utf-8')).hexdigest()[:16]}.lock"
+            for value in sorted(set(identities))
+        ]
+        self.path = self.paths[0]
+        self._handles: List[Any] = []
 
     def acquire(self) -> bool:
-        """Return False when another process already holds the lock."""
-        if self._handle is not None:
+        """Return False when another process already holds any target lock."""
+        if self._handles:
             return True
+        acquired: List[Any] = []
         try:
-            handle = open(self.path, "a+", encoding="utf-8")
-        except OSError as exc:
-            LOG.warning("无法创建实例锁文件 %s：%s；跳过重复运行检测", self.path, exc)
-            return True
-        try:
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            elif msvcrt is not None:
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                LOG.warning("当前平台不支持文件锁，跳过重复运行检测")
-        except OSError:
-            handle.close()
+            for path in self.paths:
+                handle = open(path, "a+", encoding="utf-8")
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    elif msvcrt is not None:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        LOG.warning("当前平台不支持文件锁，跳过重复运行检测")
+                except OSError:
+                    handle.close()
+                    raise BlockingIOError
+                try:
+                    handle.seek(0)
+                    handle.truncate()
+                    handle.write(str(os.getpid()))
+                    handle.flush()
+                except OSError:
+                    pass
+                acquired.append(handle)
+        except BlockingIOError:
+            for handle in acquired:
+                self._unlock(handle)
             return False
-        try:
-            handle.seek(0)
-            handle.truncate()
-            handle.write(str(os.getpid()))
-            handle.flush()
-        except OSError:
-            pass  # PID 仅用于诊断，写入失败不影响互斥
-        self._handle = handle
+        except OSError as exc:
+            for handle in acquired:
+                self._unlock(handle)
+            LOG.warning("无法创建实例锁文件：%s；跳过重复运行检测", exc)
+            return True
+        self._handles = acquired
         return True
 
-    def release(self) -> None:
-        handle, self._handle = self._handle, None
-        if handle is None:
-            return
+    def _unlock(self, handle: Any) -> None:
         try:
             if fcntl is not None:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -505,7 +531,38 @@ class SingleInstanceLock:
         except OSError:
             pass
         handle.close()
+
+    def release(self) -> None:
+        handles, self._handles = self._handles, []
+        for handle in handles:
+            self._unlock(handle)
         # 锁文件本身保留：删除会与正在启动的进程产生竞态。
+
+
+_NAT64_PREFIXES = (
+    ipaddress.ip_network("64:ff9b::/96"),
+    ipaddress.ip_network("64:ff9b:1::/48"),
+)
+
+
+def _is_global_unicast(address: Any) -> bool:
+    if not address.is_global:
+        return False
+    if (
+        address.is_multicast
+        or address.is_unspecified
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
+        or address.is_private
+    ):
+        return False
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.ipv4_mapped is not None:
+            return False
+        if any(address in prefix for prefix in _NAT64_PREFIXES):
+            return False
+    return True
 
 
 class PublicIPDetector:
@@ -552,8 +609,8 @@ class PublicIPDetector:
             raise DetectionError("响应不是有效 IP 地址") from exc
         if address.version != version:
             raise DetectionError(f"返回了 IPv{address.version}，预期 IPv{version}")
-        if not address.is_global:
-            raise DetectionError(f"拒绝非公网地址 {address}")
+        if not _is_global_unicast(address):
+            raise DetectionError(f"拒绝非全球单播地址 {address}")
         return str(address), url, (time.monotonic() - started) * 1000.0
 
     def _record_source_result(
@@ -786,7 +843,7 @@ class CloudflareClient:
             ) from exc
         except urllib.error.URLError as exc:
             raise CloudflareError(f"无法连接 Cloudflare API: {exc.reason}", retryable=True) from exc
-        except TimeoutError as exc:
+        except (TimeoutError, socket.timeout) as exc:
             raise CloudflareError("连接 Cloudflare API 超时", retryable=True) from exc
 
         try:
@@ -1180,6 +1237,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--api-token-stdin",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--test-connection",
         action="store_true",
         help="验证 Token、区域权限和 DNS 记录读取权限，不写入 Cloudflare",
@@ -1247,9 +1309,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
     JSON_EVENTS_ENABLED = args.json_events
     _configure_logging(args.verbose)
+    stdin_token = sys.stdin.readline().strip() if args.api_token_stdin else None
 
     if args.discover:
-        token = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
+        token = stdin_token or os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
         if not token:
             LOG.error("发现区域需要环境变量 CLOUDFLARE_API_TOKEN")
             return 2
@@ -1300,7 +1363,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # 互斥锁按配置文件路径建立：GUI、launchd/systemd 或手动命令重复启动时，
         # 后启动的实例直接提示并退出，避免两个进程同时创建/修改同一批记录。
         # --dry-run 与 --check-ip 只读，不参与互斥。
-        lock = SingleInstanceLock(args.config)
+        lock = SingleInstanceLock(args.config, config=config)
         if not lock.acquire():
             LOG.error(
                 "检测到另一个实例正在使用同一配置运行（%s）；为避免并发修改，本实例退出",
@@ -1310,7 +1373,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         try:
-            api_token = read_api_token(config["cloudflare"])
+            api_token = read_api_token(config["cloudflare"], override=stdin_token)
         except ConfigError as exc:
             LOG.error("配置错误：%s", exc)
             return 2
@@ -1343,7 +1406,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         sort_keys=True,
                     )
                 )
-                LOG.info("Cloudflare 连接、Token、区域和 DNS 读取权限均正常")
+                LOG.info("Cloudflare 连接、Token、区域和 DNS 读取权限正常；DNS Edit 权限将在首次实际同步时验证")
                 return 0
             except CloudflareError as exc:
                 LOG.error("Cloudflare 连接测试失败：%s", exc)
